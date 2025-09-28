@@ -1,0 +1,13 @@
+mode: set
+github.com/deenikarim/sauri/sessions/session.go:24.53,29.40 3 1
+github.com/deenikarim/sauri/sessions/session.go:29.40,31.3 1 0
+github.com/deenikarim/sauri/sessions/session.go:34.2,34.51 1 1
+github.com/deenikarim/sauri/sessions/session.go:34.51,36.3 1 1
+github.com/deenikarim/sauri/sessions/session.go:39.2,39.47 1 1
+github.com/deenikarim/sauri/sessions/session.go:39.47,41.3 1 0
+github.com/deenikarim/sauri/sessions/session.go:44.2,54.41 8 1
+github.com/deenikarim/sauri/sessions/session.go:55.15,55.15 0 0
+github.com/deenikarim/sauri/sessions/session.go:59.26,59.26 0 0
+github.com/deenikarim/sauri/sessions/session.go:62.32,62.32 0 0
+github.com/deenikarim/sauri/sessions/session.go:65.10,65.10 0 1
+github.com/deenikarim/sauri/sessions/session.go:69.2,69.11 1 1

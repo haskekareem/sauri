@@ -1,0 +1,19 @@
+package controller
+
+import (
+	"github.com/deenikarim/sauri"
+	"myapp/internal/model"
+	"net/http"
+)
+
+type Controller struct {
+	AppCont *sauri.Sauri
+	Models  model.Models
+}
+
+
+// $CONTROLLERNAME$ comment goes here
+func (c *Controller) $CONTROLLERNAME$(w http.ResponseWriter, r *http.Request) {
+
+}
+

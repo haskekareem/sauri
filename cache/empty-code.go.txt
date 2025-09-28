@@ -1,0 +1,912 @@
+package cache
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"github.com/dgraph-io/badger"
+	"log"
+	"strings"
+	"sync"
+	"time"
+)
+
+var cacheMutex sync.RWMutex
+var cached = sync.Map{}
+
+// BadgerCache struct holds the Badger database instance and key prefix.
+type BadgerCache struct {
+	Conn   *badger.DB
+	Prefix string
+}
+
+// ============================ METHODS ============================
+
+// Close closes the badger connection pool.
+func (b *BadgerCache) Close() error {
+	return b.Conn.Close()
+}
+
+// prefixedKey returns the key with the specified prefix.
+func (b *BadgerCache) prefixedKey(key string) string {
+	return fmt.Sprintf("%s:%s", b.Prefix, key)
+	// return rc.Prefix + key
+}
+
+// Set adds a key-value pair to the Badger cache with a prefixed key.
+// It handles optional expiration time.
+func (b *BadgerCache) Set(keyStr string, value interface{}, expires ...time.Duration) error {
+	// Lock for concurrent writes
+	cacheMutex.Lock()
+	defer cacheMutex.Unlock()
+
+	prefixedKey := b.prefixedKey(keyStr)
+
+	entry := EntryCache{}
+	entry[prefixedKey] = value
+
+	// Encode the value to a byte slice.
+	encoded, err := encodeValue(entry)
+	if err != nil {
+		return fmt.Errorf("failed to encode value: %w", err)
+	}
+
+	// Store value in Badger with optional TTL
+	return b.Conn.Update(func(txn *badger.Txn) error {
+		e := badger.NewEntry([]byte(prefixedKey), encoded)
+
+		// Set TTL if provided.
+		if len(expires) > 0 {
+			e.WithTTL(expires[0])
+		}
+
+		return txn.SetEntry(e)
+	})
+}
+
+// Get retrieves the value for a given prefixed key from the Badger cache
+// and decodes it into an EntryCache.
+func (b *BadgerCache) Get(keyStr string) (interface{}, error) {
+	// used the read lock to ensure multiple reads can happen at the same time but block any writes.
+	cacheMutex.RLock() // Allow concurrent reads
+	defer cacheMutex.RUnlock()
+
+	var result []byte
+
+	prefixedKey := b.prefixedKey(keyStr)
+
+	// Start a read-only transaction to view the database without modifying it
+	err := b.Conn.View(func(txn *badger.Txn) error {
+		// Try to get the item (key-value pair) from the database
+		item, err := txn.Get([]byte(prefixedKey))
+		if err != nil {
+			// Return the error if key is not found or another issue occurs
+			return err
+		}
+
+		// Check if the key has expired based on its TTL (Time to Live)
+		if item.ExpiresAt() > 0 && time.Now().After(time.Unix(int64(item.ExpiresAt()), 0)) {
+			// If the current time is past the expiration time, treat the key as not found
+			return badger.ErrKeyNotFound
+		}
+
+		// Retrieve the actual value associated with the key
+		err = item.Value(func(val []byte) error {
+			// Copy the value into the result variable /The value must be copied because it’s only valid inside
+			// the transaction
+			result = append(result[:0], val...)
+			return nil
+		})
+		return err
+	})
+
+	// error from the transaction
+	if err != nil {
+		// If the key was not found or an error occurred, return a user-friendly error
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil, fmt.Errorf("key not found")
+		}
+		return nil, fmt.Errorf("transaction to get the value failed: %w", err)
+	}
+
+	// Decode the retrieved byte data into its original type (could be any type like string, number, etc.)
+	decoded, err := decodeValue(result)
+	if err != nil {
+		return nil, err
+	}
+
+	// retrieve the item from the map and return it
+	item, exists := decoded[prefixedKey]
+	if !exists {
+		return nil, fmt.Errorf("key %s not found in decoded value", prefixedKey)
+	}
+
+	return item, nil
+}
+
+// Update updates an existing key-value pair in the Badger cache, with an optional expiration time.
+func (b *BadgerCache) Update(keyStr string, value interface{}, expires ...time.Duration) error {
+	cacheMutex.Lock() // Lock for concurrent writes
+	defer cacheMutex.Unlock()
+
+	prefixedKey := b.prefixedKey(keyStr)
+
+	// initiate a EntryCache instance and store the value in it
+	entry := EntryCache{}
+	entry[prefixedKey] = value
+
+	encoded, err := encodeValue(entry)
+	if err != nil {
+		return fmt.Errorf("failed to encode value: %w", err)
+	}
+	// Update value in Badger with optional TTL
+	return b.Conn.Update(func(txn *badger.Txn) error {
+		e := badger.NewEntry([]byte(prefixedKey), encoded)
+		if len(expires) > 0 {
+			e.WithTTL(expires[0])
+		}
+		return txn.SetEntry(e)
+	})
+}
+
+// Exists checks if a key exists in the Badger cache.
+func (b *BadgerCache) Exists(keyStr string) (bool, error) {
+	cacheMutex.RLock() // Allow concurrent reads
+	defer cacheMutex.RUnlock()
+
+	prefixedKey := b.prefixedKey(keyStr)
+
+	// Check in-memory cache first
+	if val, ok := cached.Load(prefixedKey); ok {
+		if val.(time.Time).After(time.Now()) {
+			return true, nil // Key exists (cached result within the 10-second window)
+		}
+		// Remove expired cache entry if cache has expired then look into the database directly
+		cached.Delete(prefixedKey)
+	}
+
+	// If not in cache, check Badger database
+	err := b.Conn.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(prefixedKey))
+		if err != nil {
+			return err
+		}
+		// Check if the key has expired by comparing the expiration timestamp
+		if item.ExpiresAt() > 0 {
+			expiration := time.Unix(int64(item.ExpiresAt()), 0)
+			if time.Now().After(expiration) {
+				return badger.ErrKeyNotFound // Treat as non-existent if TTL has expired
+			}
+		}
+
+		return nil // Key exists and is not expired
+	})
+
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		// Key does not exist or has expired
+		return false, nil
+	}
+
+	if err == nil {
+		// Cache existence check for 10 seconds to optimize future checks
+		cached.Store(prefixedKey, time.Now().Add(45*time.Second))
+	}
+
+	return err == nil, err // Return true if key exists, otherwise the error
+}
+
+// Delete removes a key-value pair with a prefixed key from the Badger cache.
+func (b *BadgerCache) Delete(keyStr string) error {
+	cacheMutex.Lock() // Lock for concurrent writes
+	defer cacheMutex.Unlock()
+
+	prefixedKey := b.prefixedKey(keyStr)
+	// Delete the key in Badger
+	return b.Conn.Update(func(txn *badger.Txn) error {
+		err := txn.Delete([]byte(prefixedKey))
+		if err != nil {
+			return fmt.Errorf("failed to delete key %s: %w", prefixedKey, err)
+		}
+		return nil
+	})
+}
+
+// Keys retrieves all keys matching a certain pattern, a specific key, or a list of keys.
+func (b *BadgerCache) Keys(patternOrKey ...string) ([]string, error) {
+	cacheMutex.RLock() // Allow concurrent reads
+	defer cacheMutex.RUnlock()
+
+	var keys []string
+
+	if err := b.Conn.View(func(txn *badger.Txn) error {
+		// If no argument is provided, scan all keys with the prefix
+		if len(patternOrKey) == 0 {
+			opts := badger.DefaultIteratorOptions
+			opts.PrefetchValues = false
+			it := txn.NewIterator(opts)
+			defer it.Close()
+
+			prefixedPattern := fmt.Sprintf("%s:", b.Prefix)
+
+			for it.Rewind(); it.Valid(); it.Next() {
+				item := it.Item()
+				if bytes.HasPrefix(item.Key(), []byte(prefixedPattern)) {
+					keys = append(keys, string(item.Key()))
+				}
+			}
+		} else if len(patternOrKey) == 1 {
+			// todo; If the user specifies a wildcard pattern (e.g., "key*"), the Keys method
+			//  iterates through all keys, removing the prefix and matching the key names against the pattern.
+
+			// Handle single pattern or key
+			pattern := patternOrKey[0]
+
+			if strings.Contains(pattern, "*") {
+				// Wildcard pattern, iterate over all keys and filter them
+				opts := badger.DefaultIteratorOptions
+				opts.PrefetchValues = false
+				it := txn.NewIterator(opts)
+				defer it.Close()
+
+				prefixedPattern := b.prefixedKey("")
+				for it.Rewind(); it.Valid(); it.Next() {
+					item := it.Item()
+					key := string(item.Key())
+					if bytes.HasPrefix(item.Key(), []byte(prefixedPattern)) {
+						trimmedKey := strings.TrimPrefix(key, b.Prefix+":")
+						//compare the keys with the pattern.
+						if matchWildcard(trimmedKey, pattern) {
+							keys = append(keys, key)
+						}
+					}
+
+				}
+			} else {
+				// Single key, check if it exists
+				prefixedKey := b.prefixedKey(pattern)
+				_, err := txn.Get([]byte(prefixedKey))
+				if err == nil {
+					keys = append(keys, prefixedKey)
+				} else if !errors.Is(err, badger.ErrKeyNotFound) {
+					return err
+				}
+			}
+
+		} else {
+			// Handle multiple specific keys
+			for _, k := range patternOrKey {
+				prefixedKey := b.prefixedKey(k)
+				_, err := txn.Get([]byte(prefixedKey))
+				if err == nil {
+					keys = append(keys, prefixedKey)
+				} else if !errors.Is(err, badger.ErrKeyNotFound) {
+					return err
+				}
+			}
+		}
+
+		return nil
+
+	}); err != nil {
+		return nil, fmt.Errorf("failed to retrieve keys: %w", err)
+	}
+	return keys, nil
+}
+
+// KeysWithBatchSize retrieves all keys matching a certain pattern, a specific key, or a list of keys,
+// with pagination support.
+func (b *BadgerCache) KeysWithBatchSize(batchSize int, patternOrKey ...string) ([]string, error) {
+	cacheMutex.RLock() // Allow concurrent reads
+	defer cacheMutex.RUnlock()
+
+	if batchSize == 0 {
+		batchSize = 1000 // Default batch size, or any appropriate value
+	}
+
+	var keys []string
+
+	if err := b.Conn.View(func(txn *badger.Txn) error {
+		// If no argument is provided, scan all keys with the prefix
+		if len(patternOrKey) == 0 {
+			opts := badger.DefaultIteratorOptions
+			opts.PrefetchValues = false
+			opts.PrefetchSize = batchSize
+			it := txn.NewIterator(opts)
+			defer it.Close()
+
+			prefixedPattern := fmt.Sprintf("%s:", b.Prefix)
+
+			for it.Rewind(); it.Valid(); it.Next() {
+				item := it.Item()
+				if bytes.HasPrefix(item.Key(), []byte(prefixedPattern)) {
+					keys = append(keys, string(item.Key()))
+					if len(keys) >= batchSize {
+						// Stop when we reach the batch size
+						break
+					}
+				}
+			}
+		} else if len(patternOrKey) == 1 {
+			// todo; If the user specifies a wildcard pattern (e.g., "key*"), the Keys method
+			//  iterates through all keys, removing the prefix and matching the key names against the pattern.
+
+			// Handle single pattern or key
+			pattern := patternOrKey[0]
+
+			if strings.Contains(pattern, "*") {
+				// Wildcard pattern, iterate over all keys and filter them
+				opts := badger.DefaultIteratorOptions
+				opts.PrefetchValues = false
+				opts.PrefetchSize = batchSize
+				it := txn.NewIterator(opts)
+				defer it.Close()
+
+				prefixedPattern := b.prefixedKey("")
+				for it.Rewind(); it.Valid(); it.Next() {
+					item := it.Item()
+					key := string(item.Key())
+					if bytes.HasPrefix(item.Key(), []byte(prefixedPattern)) {
+						trimmedKey := strings.TrimPrefix(key, b.Prefix+":")
+						//compare the keys with the pattern.
+						if matchWildcard(trimmedKey, pattern) {
+							keys = append(keys, key)
+							if len(keys) >= batchSize {
+								break
+							}
+						}
+					}
+
+				}
+			} else {
+				// Single key, check if it exists
+				prefixedKey := b.prefixedKey(pattern)
+				_, err := txn.Get([]byte(prefixedKey))
+				if err == nil {
+					keys = append(keys, prefixedKey)
+				} else if !errors.Is(err, badger.ErrKeyNotFound) {
+					return err
+				}
+			}
+
+		} else {
+			// Handle multiple specific keys
+			for _, k := range patternOrKey {
+				prefixedKey := b.prefixedKey(k)
+				_, err := txn.Get([]byte(prefixedKey))
+				if err == nil {
+					keys = append(keys, prefixedKey)
+				} else if !errors.Is(err, badger.ErrKeyNotFound) {
+					return err
+				}
+
+				if len(keys) >= batchSize {
+					break // Stop when we reach the batch size
+				}
+			}
+		}
+
+		return nil
+
+	}); err != nil {
+		return nil, fmt.Errorf("failed to retrieve keys: %w", err)
+	}
+	return keys, nil
+}
+
+// Expire sets a timeout on a key.
+func (b *BadgerCache) Expire(keyStr string, expiration time.Duration) error {
+	cacheMutex.Lock() // Lock for concurrent writes
+	defer cacheMutex.Unlock()
+
+	prefixedKey := b.prefixedKey(keyStr)
+
+	// Update expiration time in Badger
+	return b.Conn.Update(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(prefixedKey))
+		if err != nil {
+			return err
+		}
+
+		// Get the existing value and set a new TTL
+		return item.Value(func(val []byte) error {
+			e := badger.NewEntry([]byte(prefixedKey), val).WithTTL(expiration)
+			return txn.SetEntry(e)
+		})
+	})
+}
+
+// TTL retrieves the time-to-live of a key.
+func (b *BadgerCache) TTL(keyStr string) (time.Duration, error) {
+	cacheMutex.RLock() // Allow concurrent reads
+	defer cacheMutex.RUnlock()
+
+	prefixedKey := b.prefixedKey(keyStr)
+	var ttl time.Duration
+
+	if err := b.Conn.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(prefixedKey))
+		if err != nil {
+			return err
+		}
+		// set the time to live for the key
+		//Ensure that keys without TTL return a meaningful result (e.g., 0 duration).
+		if item.ExpiresAt() > 0 {
+			ttl = time.Until(time.Unix(int64(item.ExpiresAt()), 0))
+		} else {
+			ttl = 0
+		}
+
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("failed to retrieve TTL: %w", err)
+	}
+
+	return ttl, nil
+}
+
+// EmptyByMatch deletes all keys matching a specific pattern
+func (b *BadgerCache) EmptyByMatch(pattern string) error {
+	cacheMutex.Lock() // Lock for concurrent writes
+	defer cacheMutex.Unlock()
+	// Separate the prefix from the pattern for seeking in BadgerDB
+	prefix := strings.Split(pattern, "*")[0] //// Everything before the wildcard (*)
+	batchSize := 10000                       // Number of keys to delete in each batch
+	maxRetries := 3                          // Max retries for handling transaction conflicts
+
+	for {
+		retries := 0
+		keysDeleted := 0
+
+		// Main retry loop
+		for {
+			err := b.Conn.Update(func(txn *badger.Txn) error {
+				opts := badger.DefaultIteratorOptions
+				opts.PrefetchValues = false
+				it := txn.NewIterator(opts)
+				defer it.Close()
+
+				deleted := 0
+
+				// Seek to the prefix and iterate over keys starting with the prefix
+				for it.Seek([]byte(prefix)); it.ValidForPrefix([]byte(prefix)); it.Next() {
+					item := it.Item()
+					key := string(item.Key())
+
+					// Apply matchWildcard to check if the key matches the pattern
+					if matchWildcard(key, pattern) {
+						err := txn.Delete([]byte(key))
+						if err != nil {
+							return err
+						}
+						deleted++
+						keysDeleted++
+					}
+
+					// Stop if we've reached the batch size
+					if deleted >= batchSize {
+						break
+					}
+				}
+
+				if deleted == 0 {
+					// No more keys to delete, break the main loop
+					return nil
+				}
+				return nil
+			})
+
+			if err != nil {
+				// Handle transaction conflict
+				if errors.Is(err, badger.ErrConflict) {
+					retries++
+					log.Printf("Transaction conflict occurred. Retrying... (%d/%d)", retries, maxRetries)
+					continue // Retry the transaction
+				}
+
+				// Return other errors immediately
+				return fmt.Errorf("failed to empty keys by match: %w", err)
+			}
+
+			break // Exit retry loop if the transaction succeeds
+		}
+
+		// If retries exceeded maxRetries, return an error
+		if retries >= maxRetries {
+			return fmt.Errorf("failed to empty keys after %d retries", maxRetries)
+		}
+
+		// Break the main loop if no keys were deleted in this iteration
+		if keysDeleted == 0 {
+			break
+		}
+	}
+
+	return nil
+}
+
+// EmptyByMatched deletes all keys with the specific prefix using a pipeline.
+func (b *BadgerCache) EmptyByMatched(pattern string) error {
+	cacheMutex.Lock() // Lock for concurrent writes
+	defer cacheMutex.Unlock()
+
+	prefixedPattern := fmt.Sprintf("%s%s", b.Prefix+":", pattern)
+
+	batchSize := 10000 // Default batch size for deleting keys
+	maxRetries := 3    // Max retries for handling transaction conflicts
+
+	for {
+		retries := 0
+
+		for retries < maxRetries {
+			err := b.Conn.Update(func(txn *badger.Txn) error {
+				deleted, err := b.delKeysMatchingPattern(txn, prefixedPattern, batchSize)
+				if err != nil {
+					return err
+				}
+
+				if deleted == 0 {
+					log.Println("No more keys to delete")
+					return nil // Stop if no more keys are deleted
+				}
+				// deletion successful
+				return nil
+			})
+
+			if err != nil {
+				if errors.Is(err, badger.ErrConflict) {
+					retries++ // Increment retry count on conflict
+					log.Printf("Transaction conflict occurred. Retrying... (%d/%d)", retries, maxRetries)
+					continue // Retry the transaction
+				}
+
+				return fmt.Errorf("failed to empty keys: %w", err) // Return on non-conflict errors
+			}
+
+			break // Exit retry loop if the transaction succeeds
+		}
+
+		if retries >= maxRetries {
+			return fmt.Errorf("failed to empty keys after %d retries", maxRetries)
+		}
+
+		break // Exit the main loop if no more keys are deleted
+	}
+
+	return nil
+}
+
+func (b *BadgerCache) Empty() error {
+	cacheMutex.Lock() // Lock for concurrent writes
+	defer cacheMutex.Unlock()
+
+	prefixedPattern := fmt.Sprintf("%s:", b.Prefix)
+
+	batchSize := 10000 // Default batch size for deleting keys
+	maxRetries := 3    // Max retries for handling transaction conflicts
+
+	for {
+		retries := 0
+
+		for retries < maxRetries {
+			err := b.Conn.Update(func(txn *badger.Txn) error {
+				deleted, err := b.deleteKeysMatchingPattern(txn, prefixedPattern, batchSize)
+				if err != nil {
+					return err
+				}
+
+				if deleted == 0 {
+					log.Println("No more keys to delete")
+					return nil // Stop if no more keys are deleted
+				}
+				// deletion successful
+				return nil
+			})
+
+			if err != nil {
+				if errors.Is(err, badger.ErrConflict) {
+					retries++ // Increment retry count on conflict
+					log.Printf("Transaction conflict occurred. Retrying... (%d/%d)", retries, maxRetries)
+					continue // Retry the transaction
+				}
+
+				return fmt.Errorf("failed to empty keys: %w", err) // Return on non-conflict errors
+			}
+
+			break // Exit retry loop if the transaction succeeds
+		}
+
+		if retries >= maxRetries {
+			return fmt.Errorf("failed to empty keys after %d retries", maxRetries)
+		}
+
+		break // Exit the main loop if no more keys are deleted
+	}
+
+	return nil
+}
+
+// ============================ HELPER FUNCTIONS ============================
+// deleteKeysMatchingPattern deletes keys in batches of 10,000 that match the specified pattern.
+func (b *BadgerCache) deleteKeysMatchingPattern(txn *badger.Txn, pattern string, batchSize int) (int, error) {
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchValues = false
+	it := txn.NewIterator(opts)
+	defer it.Close()
+
+	deleted := 0
+
+	for it.Seek([]byte(pattern)); it.ValidForPrefix([]byte(pattern)); it.Next() {
+		item := it.Item()
+
+		// Delete the key
+		err := txn.Delete(item.Key())
+		if err != nil {
+			return deleted, fmt.Errorf("failed to delete key %s: %w", item.Key(), err)
+		}
+		deleted++
+
+		// Stop if we reach the max batch size
+		if deleted >= batchSize {
+			break
+		}
+	}
+
+	return deleted, nil
+}
+
+// matchWildcard is a helper function that matches strings against wildcard patterns (like "key*").
+func matchWildcard(str, pattern string) bool {
+	// Split the pattern by "*" to get the parts before and after the wildcard.
+	parts := strings.Split(pattern, "*")
+
+	if len(parts) == 1 {
+		// If there's no "*", the pattern should exactly match the string.
+		return str == pattern
+	}
+
+	// Match the beginning part before the wildcard.
+	if !strings.HasPrefix(str, parts[0]) {
+		return false
+	}
+
+	// If there's a second part (after "*"), match the end of the string.
+	if len(parts) > 1 && parts[1] != "" && !strings.HasSuffix(str, parts[1]) {
+		return false
+	}
+
+	return true
+}
+
+func (b *BadgerCache) delKeysMatchingPattern(txn *badger.Txn, pattern string, batchSize int) (int, error) {
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchValues = false
+	it := txn.NewIterator(opts)
+	defer it.Close()
+
+	deleted := 0
+
+	// Use the prefix of the pattern (everything before the wildcard) for Seek.
+	prefix := strings.Split(pattern, "*")[0]
+
+	// Iterate over keys starting from the prefix
+	for it.Seek([]byte(prefix)); it.ValidForPrefix([]byte(prefix)); it.Next() {
+		item := it.Item()
+		key := string(item.Key())
+
+		// Apply matchWildcard to check if the key matches the pattern
+		if matchWildcard(key, pattern) {
+			err := txn.Delete([]byte(key))
+			if err != nil {
+				return deleted, fmt.Errorf("failed to delete key %s: %w", key, err)
+			}
+			deleted++
+		}
+
+		// Stop if we've reached the batch size
+		if deleted >= batchSize {
+			break
+		}
+	}
+
+	return deleted, nil
+}
+
+/ EmptyByMatch deletes all keys matching a specific pattern
+func (b *BadgerCache) EmptyByMatch(pattern string) error {
+	cacheMutex.Lock() // Lock for concurrent writes
+	defer cacheMutex.Unlock()
+
+	prefix := strings.Split(pattern, "*")[0] // Extract the prefix from the pattern (e.g., "key")
+	batchSize := 10000                       // Default batch size for deleting keys
+	maxRetries := 3                          // Max retries for handling transaction conflicts
+
+	prefixedPattern := fmt.Sprintf("%s%s", b.Prefix+":", prefix)
+
+	for {
+		retries := 0
+
+		// Main retry loop
+		for retries < maxRetries {
+			err := b.Conn.Update(func(txn *badger.Txn) error {
+				deleted, err := b.deleteKeysMatchingPattern(txn, prefixedPattern, batchSize)
+				if err != nil {
+					return err
+				}
+
+				if deleted == 0 {
+					log.Println("No more keys to delete")
+					return nil // Stop if no more keys are deleted
+				}
+				return nil
+			})
+
+			if err != nil {
+				if errors.Is(err, badger.ErrConflict) {
+					retries++ // Retry if there's a conflict
+					continue
+				}
+				return fmt.Errorf("failed to empty keys by match: %w", err)
+			}
+
+			break // Exit retry loop if transaction succeeds
+		}
+
+		if retries >= maxRetries {
+			return fmt.Errorf("failed to empty keys after %d retries", maxRetries)
+		}
+
+		break // Exit the main loop if no more keys are deleted
+	}
+
+	return nil
+}
+
+// Empty deletes all keys with the specific prefix using a pipeline
+func (b *BadgerCache) Empty() error {
+	cacheMutex.Lock() // Lock for concurrent writes
+	defer cacheMutex.Unlock()
+
+	prefixedPattern := fmt.Sprintf("%s:", b.Prefix) // e.g., "gudu:"
+	batchSize := 10000                              // Default batch size for deleting keys
+	maxRetries := 3                                 // Max retries for handling transaction conflicts
+	// main loop
+	for {
+		retries := 0
+		// retry loop
+		for retries < maxRetries {
+			err := b.Conn.Update(func(txn *badger.Txn) error {
+				deleted, err := b.deleteKeysMatchingPattern(txn, prefixedPattern, batchSize)
+				if err != nil {
+					return err
+				}
+
+				if deleted == 0 {
+					log.Println("No more keys to delete")
+					return nil // Stop if no more keys are deleted
+				}
+				return nil
+			})
+
+			if err != nil {
+				if errors.Is(err, badger.ErrConflict) {
+					retries++ // Retry if there's a conflict
+					continue
+				}
+				return fmt.Errorf("failed to empty keys: %w", err)
+			}
+
+			break // Exit retry loop if transaction succeeds
+		}
+
+		if retries >= maxRetries {
+			return fmt.Errorf("failed to empty keys after %d retries", maxRetries)
+		}
+
+		break // Exit the main loop if no more keys are deleted
+	}
+
+	return nil
+}
+
+// ============================ HELPER FUNCTIONS ============================
+// deleteKeysMatchingPattern deletes keys in batches of 10,000 that match the specified pattern.
+func (b *BadgerCache) deleteKeysMatchingPattern(txn *badger.Txn, pattern string, batchSize int) (int, error) {
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchValues = false
+	it := txn.NewIterator(opts)
+	defer it.Close()
+
+	deleted := 0
+	prefix := strings.Split(pattern, "*")[0] // Get the prefix from the pattern
+
+	for it.Seek([]byte(prefix)); it.ValidForPrefix([]byte(prefix)); it.Next() {
+		item := it.Item()
+		key := string(item.Key())
+
+		// If the user specifies a pattern like "key*", apply wildcard matching
+		if strings.Contains(pattern, "*") {
+			if !matchWildcard(key, pattern) {
+				continue
+			}
+		}
+
+		err := txn.Delete([]byte(key))
+		if err != nil {
+			return deleted, fmt.Errorf("failed to delete key %s: %w", key, err)
+		}
+		deleted++
+
+		if deleted >= batchSize {
+			break // Stop when batch size is reached
+		}
+	}
+
+	return deleted, nil
+}
+
+// emptyWithRetries handles retry logic and batch processing for key deletion.
+func (b *BadgerCache) emptyWithRetries(
+	deleteFunc func(*badger.Txn, int) (int, error), batchSize int, maxRetries int) error {
+
+	cacheMutex.Lock() // Lock for concurrent writes
+	defer cacheMutex.Unlock()
+
+	for {
+		retries := 0
+		for retries < maxRetries {
+			err := b.Conn.Update(func(txn *badger.Txn) error {
+				deleted, err := deleteFunc(txn, batchSize)
+				if err != nil {
+					return err
+				}
+
+				if deleted == 0 {
+					log.Println("No more keys to delete")
+					return nil // Stop if no more keys are deleted
+				}
+				return nil
+			})
+
+			if err != nil {
+				if errors.Is(err, badger.ErrConflict) {
+					retries++
+					log.Printf("Transaction conflict occurred. Retrying... (%d/%d)", retries, maxRetries)
+					continue // Retry the transaction
+				}
+				return fmt.Errorf("failed to empty keys: %w", err) // Return on non-conflict errors
+			}
+			break // Exit retry loop if the transaction succeeds
+		}
+
+		if retries >= maxRetries {
+			return fmt.Errorf("failed to empty keys after %d retries", maxRetries)
+		}
+		break // Exit the main loop if no more keys are deleted
+	}
+
+	return nil
+}
+
+// matchWildcard is a helper function that matches strings against wildcard patterns (like "key*").
+func matchWildcard(str, pattern string) bool {
+	// Split the pattern by "*" to get the parts before and after the wildcard.
+	parts := strings.Split(pattern, "*")
+
+	if len(parts) == 1 {
+		// If there's no "*", the pattern should exactly match the string.
+		return str == pattern
+	}
+
+	// Match the beginning part before the wildcard.
+	if !strings.HasPrefix(str, parts[0]) {
+		return false
+	}
+
+	// If there's a second part (after "*"), match the end of the string.
+	if len(parts) > 1 && parts[1] != "" && !strings.HasSuffix(str, parts[1]) {
+		return false
+	}
+
+	// If only prefix is present (like "test*"), and the key starts with "test", it's a match.
+	return true
+}

@@ -1,0 +1,236 @@
+package model
+
+import (
+	"crypto/subtle"
+	"errors"
+	"fmt"
+	"github.com/upper/db/v4"
+	"golang.org/x/crypto/bcrypt"
+	"log"
+	"time"
+)
+
+// User represents the users table in the database
+type User struct {
+	ID        int       `db:"id,omitempty"`
+	FirstName string    `db:"first_name"`
+	LastName  string    `db:"last_name"`
+	Email     string    `db:"email"`
+	Active    int       `db:"user_active"`
+	Password  string    `db:"password"`
+	CreatedAt time.Time `db:"created_at"`
+	UpdatedAt time.Time `db:"updated_at"`
+	Token     Token     `db:"-"`
+}
+
+/*func (u *User) Validate(validator *gudu.Validator) {
+
+}*/
+
+// hashPassword hashes the user's password with bcrypt
+func hashPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(hash), nil
+}
+
+// getTokenForUser fetches the latest active token for a user
+func getTokenForUser(userID int) (Token, error) {
+	var t Token
+
+	col := upperDBSession.Collection(t.TableName())
+	result := col.Find(db.Cond{"user_id": userID, "expiry >": time.Now()}).OrderBy("created_at desc")
+	err := result.One(&t)
+	if err != nil && !errors.Is(err, db.ErrNilRecord) && !errors.Is(err, db.ErrNoMoreRows) {
+		return t, fmt.Errorf("failed to get token for user %d: %w", userID, err)
+	}
+	return t, nil
+}
+
+// TableName returns the name of the table
+func (u *User) TableName() string {
+	return "users"
+}
+
+// Update updates an existing user's details in the database.
+func (u *User) Update(theUser *User) error {
+	err := upperDBSession.Tx(func(tx db.Session) error {
+		// update the timestamp
+		theUser.UpdatedAt = time.Now()
+
+		// hash the password
+		hashPassword, err := hashPassword(theUser.Password)
+		if err != nil {
+			return fmt.Errorf("failed to hash password: %v", err)
+		}
+
+		theUser.Password = hashPassword
+
+		// update user record
+		col := tx.Collection(u.TableName())
+		res := col.Find(db.Cond{"id =": theUser.ID})
+		err = res.Update(theUser)
+		if err != nil {
+			return fmt.Errorf("failed to update user: %v", err)
+		}
+		return nil
+	})
+
+	// handle transaction error
+	if err != nil {
+		return fmt.Errorf("transaction error: %v", err)
+	}
+	return nil
+}
+
+// Delete removes a user from the database.
+func (u *User) Delete(id int) error {
+	err := upperDBSession.Tx(func(tx db.Session) error {
+		col := tx.Collection(u.TableName())
+		err := col.Find(db.Cond{"id": id}).Delete()
+		if err != nil {
+			return fmt.Errorf("failed to delete user: %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("transaction error: %v", err)
+	}
+
+	return nil
+}
+
+// Create inserts a new user, and returns the newly inserted id
+func (u *User) Create(theUser User) (int, error) {
+	newHashPassword, err := hashPassword(theUser.Password)
+	if err != nil {
+		return 0, fmt.Errorf("failed to hash password: %v", err)
+	}
+
+	theUser.Password = newHashPassword
+	theUser.CreatedAt = time.Now()
+	theUser.UpdatedAt = time.Now()
+
+	// get the table
+	col := upperDBSession.Collection(u.TableName())
+	res, err := col.Insert(theUser)
+	if err != nil {
+		return 0, fmt.Errorf("failed to insert user: %v", err)
+	}
+
+	// get the inserted id
+	lastInsertId := getInsertId(res.ID())
+
+	return lastInsertId, nil
+}
+
+// GetAll fetches all users from the database
+func (u *User) GetAll() ([]*User, error) {
+	var allUsers []*User
+	// get the required user
+	err := upperDBSession.Collection(u.TableName()).Find().OrderBy("last_name").All(&allUsers)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve users: %v", err)
+	}
+
+	return allUsers, nil
+}
+
+// GetById fetches a user from the database by their ID.
+func (u *User) GetById(id int) (*User, error) {
+	var theUser *User
+	col := upperDBSession.Collection(u.TableName())
+	result := col.Find(db.Cond{"id": id})
+	err := result.One(&theUser)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user %v", err)
+	}
+
+	// get the associated user token
+	token, err := getTokenForUser(theUser.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get token for user %v", err)
+	}
+	// store the token
+	theUser.Token = token
+
+	return theUser, nil
+}
+
+// GetByEmail fetches a user from the database by their email address.
+func (u *User) GetByEmail(email string) (*User, error) {
+	var theUser *User
+	col := upperDBSession.Collection(u.TableName())
+	result := col.Find(db.Cond{"email =": email})
+	err := result.One(&theUser)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user by email %v", err)
+	}
+
+	// get the associated user token
+	token, err := getTokenForUser(theUser.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get token for user %v", err)
+	}
+
+	theUser.Token = token
+
+	return theUser, nil
+}
+
+// ResetPassword resets the user's password
+func (u *User) ResetPassword(id int, password string) error {
+	newPasswordHash, err := hashPassword(password)
+	if err != nil {
+		return err
+	}
+
+	// get the user
+	theUser, err := u.GetById(id)
+	if err != nil {
+		return err
+	}
+
+	theUser.Password = newPasswordHash
+
+	err = theUser.Update(theUser)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// PasswordMatched check if the given clear text password matches the stored hashed password
+// it also mitigates timing attacks and logs failed attempts
+func (u *User) PasswordMatched(clearTextPassword string) (bool, error) {
+
+	start := time.Now()
+
+	// perform bcrypt comparison
+	err := bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(clearTextPassword))
+	if err != nil {
+		// timing attach mitigation: introduce a constant time comparison to prevent attackers
+		// from learning if the error is related to timing
+		// ensure the function doesn't leak whether the mismatch was based on length or content
+		_ = subtle.ConstantTimeCompare([]byte(u.Password), []byte(clearTextPassword))
+
+		// logging failed attempts for securing monitoring
+		if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+			// invalid password
+			log.Printf("failed password attempt for user ID %d at %v", u.ID, time.Now())
+			return false, nil
+		}
+
+		// log any other bcrypt errors (eg corruption or unexpected inputs)
+		log.Printf("Error in password comparison for user ID %d: %v", u.ID, err)
+		return false, fmt.Errorf("error during password comparison: %v", err)
+	}
+
+	// calculate the time taken and log it for monitoring ( detect slow-downs)
+	duration := time.Since(start)
+	log.Printf("Password match check for user ID %d took %v", u.ID, duration)
+
+	return true, nil
+}
