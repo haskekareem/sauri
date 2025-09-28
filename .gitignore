@@ -1,4 +1,4 @@
 .idea
-dist/*
+dist
 go.work
 go.work.sum
