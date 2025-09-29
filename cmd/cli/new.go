@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/fatih/color"
 	"github.com/go-git/go-git/v5"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
@@ -29,7 +30,7 @@ func doNew(appName string) {
 	color.Green("\tcloning project repository.....")
 	// Clones the repository into the given dir, just as a normal git clone does
 	_, err := git.PlainClone("./"+appName, false, &git.CloneOptions{
-		URL:      "https://github.com/haskekareem/sauri-skeleton.git",
+		URL:      "https://github.com/haskekareem/bare-sauri.git",
 		Progress: os.Stdout,
 		Depth:    1,
 	})
@@ -63,7 +64,7 @@ func doNew(appName string) {
 		exitGracefully(err)
 	}
 
-	// OS-specific Makefile handling
+	/* OS-specific Makefile handling
 	var makefileSource string
 	if runtime.GOOS == "windows" {
 		makefileSource = fmt.Sprintf("./%s/Makefile", appName)
@@ -73,16 +74,50 @@ func doNew(appName string) {
 	err = copyFile(makefileSource, fmt.Sprintf("./%s/Makefile", appName))
 	if err != nil {
 		exitGracefully(err)
-	}
-
+	} */
 	// Clean up OS-specific files
 	color.Yellow("\tCleaning up OS-specific Makefiles...")
-	go func() {
-		_ = os.Remove(fmt.Sprintf("./%s/Makefile", appName))
-	}()
-	go func() {
-		_ = os.Remove(fmt.Sprintf("./%s/Makefile.mac", appName))
-	}()
+	// create a makefile
+	if runtime.GOOS == "windows" {
+		source, err := os.Open(fmt.Sprintf("./%s/Makefile", appName))
+		if err != nil {
+			exitGracefully(err)
+		}
+		defer source.Close()
+
+		destination, err := os.Create(fmt.Sprintf("./%s/Makefile", appName))
+		if err != nil {
+			exitGracefully(err)
+		}
+		defer destination.Close()
+
+		_, err = io.Copy(destination, source)
+		if err != nil {
+			exitGracefully(err)
+		}
+	} else {
+		source, err := os.Open(fmt.Sprintf("./%s/Makefile.mac", appName))
+		if err != nil {
+			exitGracefully(err)
+		}
+		defer source.Close()
+
+		destination, err := os.Create(fmt.Sprintf("./%s/Makefile", appName))
+		if err != nil {
+			exitGracefully(err)
+		}
+		defer destination.Close()
+
+		_, err = io.Copy(destination, source)
+		if err != nil {
+			exitGracefully(err)
+		}
+	}
+	_ = os.Remove("./" + appName + "/Makefile.mac")
+	_ = os.Remove("./" + appName + "/Makefile")
+
+	/*_ = os.Remove(fmt.Sprintf("./%s/Makefile", appName))
+	_ = os.Remove(fmt.Sprintf("./%s/Makefile.mac", appName))*/
 
 	//todo update the go mod file
 	// delete the go mod file that came with the cloning and create the appropriate mod file
