@@ -96,26 +96,45 @@ func (s *Sauri) NewApp(currentRootPath string) error {
 	s.Responses = s.NewResponse()
 
 	// todo: call OpenDBConnectionPool to connect to the DB
-	//// Build DSN based on environment variables
-	dsn, err := s.BuildDSN()
-	if err != nil {
-		errorLog.Println("can not build DSN: ", err)
-		return err
-	}
-	dbDriverType := os.Getenv("DATABASE_TYPE")
+
+	// Check if the user wants to use the database
 	dbUse, _ := strconv.ParseBool(os.Getenv("DATABASE_USE"))
+	// Initialize dsn and dbDriverType with safe defaults
+	var (
+		dsn          string
+		dbDriverType string
+	)
+	// Only build DSN and connect to DB if user enabled it
 	if dbUse {
+		dbDriverType = os.Getenv("DATABASE_TYPE")
+
+		// Build DSN based on environment variables
+		var err error
+		dsn, err = s.BuildDSN()
+		if err != nil {
+			errorLog.Println("Cannot build DSN:", err)
+			return err
+		}
+		// Open database connection pool
 		sqlDB, pgxPool, err := s.OpenDBConnectionPool(dbDriverType, dsn)
 		if err != nil {
-			errorLog.Println("can not open DB connection pool: ", err)
+			errorLog.Println("Cannot open DB connection pool:", err)
 			os.Exit(1)
 		}
-		// populate database in the sauri structure
+		// Populate database in the Sauri structure
 		s.DBConn = DatabaseConn{
 			DatabaseType: dbDriverType,
 			SqlConnPool:  sqlDB,
 			PgxConnPool:  pgxPool,
 		}
+
+		infoLog.Println("Database connection established successfully")
+	} else {
+		infoLog.Println("DATABASE_USE is set to false. Skipping database connection...")
+
+		// Still set DSN and DB type safely for config consistency
+		dbDriverType = os.Getenv("DATABASE_TYPE")
+		dsn = "" // or a placeholder like "disabled"
 	}
 
 	// todo connect to redis server
